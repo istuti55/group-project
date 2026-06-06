@@ -3,6 +3,17 @@ import google.generativeai as genai
 from pypdf import PdfReader
 import io
 
+
+def _configure_and_embed(api_key: str, content, task_type: str) -> list:
+    """Configure the Gemini API and return embeddings for the given content."""
+    genai.configure(api_key=api_key)
+    response = genai.embed_content(
+        model="models/text-embedding-004",
+        content=content,
+        task_type=task_type,
+    )
+    return response["embedding"]
+
 def extract_text_from_pdf(pdf_file_bytes, filename: str) -> list[dict]:
     """
     Extracts text page-by-page from an uploaded PDF.
@@ -79,20 +90,15 @@ class VectorStore:
         if not chunks:
             return
             
-        genai.configure(api_key=api_key)
         texts = [c["text"] for c in chunks]
         
         # Batch requests to avoid API payload limit and optimize performance
         batch_size = 100
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i + batch_size]
-            response = genai.embed_content(
-                model="models/text-embedding-004",
-                content=batch_texts,
-                task_type="retrieval_document"
-            )
+            batch_embeddings = _configure_and_embed(api_key, batch_texts, "retrieval_document")
             
-            for j, emb in enumerate(response["embedding"]):
+            for j, emb in enumerate(batch_embeddings):
                 self.embeddings.append(np.array(emb, dtype=np.float32))
                 self.chunks.append(chunks[i + j])
                 
@@ -103,13 +109,8 @@ class VectorStore:
         if not self.embeddings:
             return []
             
-        genai.configure(api_key=api_key)
-        response = genai.embed_content(
-            model="models/text-embedding-004",
-            content=query,
-            task_type="retrieval_query"
-        )
-        query_emb = np.array(response["embedding"], dtype=np.float32)
+        raw_embedding = _configure_and_embed(api_key, query, "retrieval_query")
+        query_emb = np.array(raw_embedding, dtype=np.float32)
         
         similarities = []
         for emb in self.embeddings:
@@ -135,8 +136,6 @@ def generate_answer(query: str, search_results: list[dict], api_key: str, model_
     """
     Generates an answer using the retrieved context from search_results.
     """
-    genai.configure(api_key=api_key)
-    
     # Format context
     context_parts = []
     for i, res in enumerate(search_results):
@@ -166,6 +165,7 @@ def generate_answer(query: str, search_results: list[dict], api_key: str, model_
         f"DETAILED ANSWER:"
     )
     
+    genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
         model_name=model_name,
         system_instruction=system_instruction

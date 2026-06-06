@@ -6,6 +6,54 @@ import rag_engine
 # Load environment variables
 load_dotenv()
 
+
+# --- SHARED UI HELPERS ---
+
+_SESSION_DEFAULTS = {
+    "vector_store": None,
+    "processed_files": set,
+    "doc_metrics": lambda: {"files": 0, "pages": 0, "chunks": 0},
+    "chat_history": list,
+}
+
+
+def init_session_defaults():
+    """Initialize any missing session-state keys from _SESSION_DEFAULTS."""
+    for key, factory in _SESSION_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = factory() if callable(factory) else factory
+
+
+def render_metric_card(value, label: str):
+    """Render a single glassmorphism metric card."""
+    st.markdown(
+        f'<div class="metric-card">'
+        f'<div class="metric-value">{value}</div>'
+        f'<div class="metric-label">{label}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_api_status(is_loaded: bool):
+    """Show the API-key status pill in the sidebar."""
+    if is_loaded:
+        html = '<div class="api-status status-ok">✓ Key Loaded</div>'
+    else:
+        html = '<div class="api-status status-missing">✗ Key Missing</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_source_chunks(sources: list[dict]):
+    """Render retrieved context chunks inside an expander."""
+    with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
+        for i, src in enumerate(sources):
+            chunk = src["chunk"]
+            st.markdown(
+                f"**Source #{i+1}**: `{chunk['source']}` | "
+                f"Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
+            )
+            st.code(chunk["text"], language="text")
+
 # Page configuration
 st.set_page_config(
     page_title="Contextual RAG Assistant",
@@ -154,14 +202,7 @@ st.markdown(
 )
 
 # Initialize Session States
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = set()
-if "doc_metrics" not in st.session_state:
-    st.session_state.doc_metrics = {"files": 0, "pages": 0, "chunks": 0}
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+init_session_defaults()
 
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
@@ -182,16 +223,7 @@ with st.sidebar:
     )
     
     # Visual validation indicator
-    if api_key_input:
-        st.markdown(
-            '<div class="api-status status-ok">✓ Key Loaded</div>', 
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown(
-            '<div class="api-status status-missing">✗ Key Missing</div>', 
-            unsafe_allow_html=True
-        )
+    render_api_status(bool(api_key_input))
         
     st.markdown("---")
     
@@ -307,21 +339,13 @@ with col_left:
         # Display Database metrics
         st.markdown("### 📊 Index Metrics")
         m_col1, m_col2, m_col3 = st.columns(3)
-        with m_col1:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-value">{st.session_state.doc_metrics["files"]}</div><div class="metric-label">Files</div></div>',
-                unsafe_allow_html=True
-            )
-        with m_col2:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-value">{st.session_state.doc_metrics["pages"]}</div><div class="metric-label">Pages</div></div>',
-                unsafe_allow_html=True
-            )
-        with m_col3:
-            st.markdown(
-                f'<div class="metric-card"><div class="metric-value">{st.session_state.doc_metrics["chunks"]}</div><div class="metric-label">Chunks</div></div>',
-                unsafe_allow_html=True
-            )
+        metrics = st.session_state.doc_metrics
+        for col, (value, label) in zip(
+            [m_col1, m_col2, m_col3],
+            [(metrics["files"], "Files"), (metrics["pages"], "Pages"), (metrics["chunks"], "Chunks")],
+        ):
+            with col:
+                render_metric_card(value, label)
             
         # List indexed files
         st.markdown("### 📎 Indexed Documents")
@@ -345,13 +369,7 @@ with col_right:
                     st.write(message["content"])
                     # If assistant and has source context, display in expander
                     if message["role"] == "assistant" and "sources" in message:
-                        with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
-                            for i, src in enumerate(message["sources"]):
-                                chunk = src["chunk"]
-                                st.markdown(
-                                    f"**Source #{i+1}**: `{chunk['source']}` | Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
-                                )
-                                st.code(chunk["text"], language="text")
+                        render_source_chunks(message["sources"])
         
         # User input
         if query := st.chat_input("Ask a question about your documents..."):
@@ -387,13 +405,7 @@ with col_right:
                         with chat_container:
                             with st.chat_message("assistant"):
                                 st.write(answer)
-                                with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
-                                    for i, src in enumerate(results):
-                                        chunk = src["chunk"]
-                                        st.markdown(
-                                            f"**Source #{i+1}**: `{chunk['source']}` | Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
-                                        )
-                                        st.code(chunk["text"], language="text")
+                                render_source_chunks(results)
                         
                         # Save assistant message
                         st.session_state.chat_history.append({
