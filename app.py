@@ -1,7 +1,10 @@
+import logging
 import streamlit as st
 import os
 from dotenv import load_dotenv
 import rag_engine
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -274,34 +277,50 @@ with col_left:
                             
                         total_pages = 0
                         all_chunks = []
+                        successfully_read = []
                         
                         for file in new_files:
-                            file_bytes = file.read()
-                            # Extract text
-                            pages = rag_engine.extract_text_from_pdf(file_bytes, file.name)
+                            try:
+                                file_bytes = file.read()
+                            except Exception as exc:
+                                logger.error("Failed to read uploaded file '%s': %s", file.name, exc)
+                                st.warning(f"Could not read '{file.name}', skipping.")
+                                continue
+
+                            try:
+                                pages = rag_engine.extract_text_from_pdf(file_bytes, file.name)
+                            except ValueError as exc:
+                                logger.error("PDF extraction failed for '%s': %s", file.name, exc)
+                                st.warning(f"'{file.name}' could not be parsed: {exc}")
+                                continue
+
                             total_pages += len(pages)
-                            
-                            # Create chunks
+
                             chunks = rag_engine.chunk_text(
-                                pages, 
-                                chunk_size=chunk_size, 
+                                pages,
+                                chunk_size=chunk_size,
                                 chunk_overlap=chunk_overlap
                             )
                             all_chunks.extend(chunks)
-                            
-                            st.session_state.processed_files.add(file.name)
-                            
-                        # Add embeddings to store
-                        st.session_state.vector_store.add_chunks(all_chunks, api_key_input)
-                        
-                        # Update metrics
-                        st.session_state.doc_metrics["files"] += len(new_files)
-                        st.session_state.doc_metrics["pages"] += total_pages
-                        st.session_state.doc_metrics["chunks"] += len(all_chunks)
-                        
-                        st.success(f"Successfully processed {len(new_files)} new file(s)!")
-                        
+                            successfully_read.append(file.name)
+
+                        if not all_chunks:
+                            st.warning("No text could be extracted from the uploaded files.")
+                        else:
+                            # Add embeddings — only mark files as processed after success
+                            st.session_state.vector_store.add_chunks(all_chunks, api_key_input)
+
+                            for name in successfully_read:
+                                st.session_state.processed_files.add(name)
+
+                            st.session_state.doc_metrics["files"] += len(successfully_read)
+                            st.session_state.doc_metrics["pages"] += total_pages
+                            st.session_state.doc_metrics["chunks"] += len(all_chunks)
+
+                            st.success(f"Successfully processed {len(successfully_read)} new file(s)!")
+
                     except Exception as e:
+                        logger.exception("Unexpected error during file processing")
                         st.error(f"Failed to process files: {e}")
                         
         # Display Database metrics
@@ -368,42 +387,45 @@ with col_right:
             else:
                 with st.spinner("Retrieving document contexts and generating answer..."):
                     try:
-                        # Retrieve documents
                         results = st.session_state.vector_store.search(
-                            query, 
-                            api_key_input, 
+                            query,
+                            api_key_input,
                             k=5
                         )
-                        
-                        # Generate answer
-                        answer = rag_engine.generate_answer(
-                            query, 
-                            results, 
-                            api_key_input, 
-                            model_name=model_choice
-                        )
-                        
-                        # Display assistant message
-                        with chat_container:
-                            with st.chat_message("assistant"):
-                                st.write(answer)
-                                with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
-                                    for i, src in enumerate(results):
-                                        chunk = src["chunk"]
-                                        st.markdown(
-                                            f"**Source #{i+1}**: `{chunk['source']}` | Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
-                                        )
-                                        st.code(chunk["text"], language="text")
-                        
-                        # Save assistant message
-                        st.session_state.chat_history.append({
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": results
-                        })
-                        
-                        # Rerun to scroll container and refresh state
-                        st.rerun()
-                        
                     except Exception as e:
-                        st.error(f"Error querying RAG system: {e}")
+                        logger.exception("Document search failed")
+                        st.error(f"Document search failed: {e}")
+                        results = None
+
+                    if results is not None:
+                        try:
+                            answer = rag_engine.generate_answer(
+                                query,
+                                results,
+                                api_key_input,
+                                model_name=model_choice
+                            )
+                        except Exception as e:
+                            logger.exception("Answer generation failed")
+                            st.error(f"Answer generation failed: {e}")
+                            answer = None
+
+                        if answer is not None:
+                            with chat_container:
+                                with st.chat_message("assistant"):
+                                    st.write(answer)
+                                    with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
+                                        for i, src in enumerate(results):
+                                            chunk = src["chunk"]
+                                            st.markdown(
+                                                f"**Source #{i+1}**: `{chunk['source']}` | Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
+                                            )
+                                            st.code(chunk["text"], language="text")
+
+                            st.session_state.chat_history.append({
+                                "role": "assistant",
+                                "content": answer,
+                                "sources": results
+                            })
+
+                            st.rerun()

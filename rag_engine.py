@@ -1,18 +1,28 @@
+import logging
 import numpy as np
 import google.generativeai as genai
 from pypdf import PdfReader
 import io
+
+logger = logging.getLogger(__name__)
 
 def extract_text_from_pdf(pdf_file_bytes, filename: str) -> list[dict]:
     """
     Extracts text page-by-page from an uploaded PDF.
     Returns a list of dicts containing page content and metadata.
     """
-    reader = PdfReader(io.BytesIO(pdf_file_bytes))
+    try:
+        reader = PdfReader(io.BytesIO(pdf_file_bytes))
+    except Exception as exc:
+        raise ValueError(f"Failed to read '{filename}': the file may be corrupted or not a valid PDF") from exc
+
     pages_data = []
-    
     for i, page in enumerate(reader.pages):
-        text = page.extract_text()
+        try:
+            text = page.extract_text()
+        except Exception:
+            logger.warning("Could not extract text from page %d of '%s', skipping", i + 1, filename)
+            continue
         if text and text.strip():
             pages_data.append({
                 "text": text.strip(),
@@ -78,23 +88,43 @@ class VectorStore:
         """
         if not chunks:
             return
-            
+        if not api_key:
+            raise ValueError("API key is required to generate embeddings")
+
         genai.configure(api_key=api_key)
         texts = [c["text"] for c in chunks]
-        
-        # Batch requests to avoid API payload limit and optimize performance
+
         batch_size = 100
+        new_embeddings = []
+        new_chunks = []
+
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i + batch_size]
-            response = genai.embed_content(
-                model="models/text-embedding-004",
-                content=batch_texts,
-                task_type="retrieval_document"
-            )
-            
-            for j, emb in enumerate(response["embedding"]):
-                self.embeddings.append(np.array(emb, dtype=np.float32))
-                self.chunks.append(chunks[i + j])
+            try:
+                response = genai.embed_content(
+                    model="models/text-embedding-004",
+                    content=batch_texts,
+                    task_type="retrieval_document"
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Embedding API request failed on batch starting at index {i}"
+                ) from exc
+
+            embeddings_data = response.get("embedding")
+            if embeddings_data is None:
+                raise RuntimeError(
+                    f"Embedding API returned an unexpected response (missing 'embedding' key) "
+                    f"on batch starting at index {i}"
+                )
+
+            for j, emb in enumerate(embeddings_data):
+                new_embeddings.append(np.array(emb, dtype=np.float32))
+                new_chunks.append(chunks[i + j])
+
+        # Only commit to state after all batches succeed
+        self.embeddings.extend(new_embeddings)
+        self.chunks.extend(new_chunks)
                 
     def search(self, query: str, api_key: str, k: int = 5) -> list[dict]:
         """
@@ -102,14 +132,25 @@ class VectorStore:
         """
         if not self.embeddings:
             return []
-            
+        if not api_key:
+            raise ValueError("API key is required to search")
+
         genai.configure(api_key=api_key)
-        response = genai.embed_content(
-            model="models/text-embedding-004",
-            content=query,
-            task_type="retrieval_query"
-        )
-        query_emb = np.array(response["embedding"], dtype=np.float32)
+        try:
+            response = genai.embed_content(
+                model="models/text-embedding-004",
+                content=query,
+                task_type="retrieval_query"
+            )
+        except Exception as exc:
+            raise RuntimeError("Failed to generate embedding for the query") from exc
+
+        embedding_data = response.get("embedding")
+        if embedding_data is None:
+            raise RuntimeError(
+                "Embedding API returned an unexpected response (missing 'embedding' key)"
+            )
+        query_emb = np.array(embedding_data, dtype=np.float32)
         
         similarities = []
         for emb in self.embeddings:
@@ -166,10 +207,27 @@ def generate_answer(query: str, search_results: list[dict], api_key: str, model_
         f"DETAILED ANSWER:"
     )
     
+    if not api_key:
+        raise ValueError("API key is required to generate an answer")
+
     model = genai.GenerativeModel(
         model_name=model_name,
         system_instruction=system_instruction
     )
-    
-    response = model.generate_content(prompt)
-    return response.text
+
+    try:
+        response = model.generate_content(prompt)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gemini content generation failed (model={model_name})"
+        ) from exc
+
+    # response.text raises ValueError when content is blocked by safety filters
+    try:
+        return response.text
+    except ValueError:
+        # Provide feedback from the safety ratings when the response is blocked
+        feedback = getattr(response, "prompt_feedback", None)
+        raise RuntimeError(
+            f"The response was blocked by safety filters. Feedback: {feedback}"
+        )
