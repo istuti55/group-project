@@ -1,7 +1,14 @@
 import streamlit as st
 import os
+import logging
 from dotenv import load_dotenv
 import rag_engine
+
+logger = logging.getLogger(__name__)
+
+MAX_QUERY_LENGTH = 5000
+MAX_FILE_SIZE_MB = 10
+PDF_MAGIC_BYTES = b"%PDF"
 
 # Load environment variables
 load_dotenv()
@@ -259,8 +266,21 @@ with col_left:
     
     # Processing block
     if uploaded_files:
-        # Filter files that haven't been processed yet
-        new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_files]
+        # Validate files: check magic bytes and size
+        validated_files = []
+        for f in uploaded_files:
+            if f.name in st.session_state.processed_files:
+                continue
+            file_bytes = f.read()
+            if len(file_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
+                st.warning(f"⚠️ '{f.name}' exceeds the {MAX_FILE_SIZE_MB} MB size limit and was skipped.")
+                continue
+            if not file_bytes[:4].startswith(PDF_MAGIC_BYTES):
+                st.warning(f"⚠️ '{f.name}' does not appear to be a valid PDF and was skipped.")
+                continue
+            validated_files.append((f, file_bytes))
+
+        new_files = validated_files
         
         if new_files:
             if not api_key_input:
@@ -275,8 +295,7 @@ with col_left:
                         total_pages = 0
                         all_chunks = []
                         
-                        for file in new_files:
-                            file_bytes = file.read()
+                        for file, file_bytes in new_files:
                             # Extract text
                             pages = rag_engine.extract_text_from_pdf(file_bytes, file.name)
                             total_pages += len(pages)
@@ -302,7 +321,8 @@ with col_left:
                         st.success(f"Successfully processed {len(new_files)} new file(s)!")
                         
                     except Exception as e:
-                        st.error(f"Failed to process files: {e}")
+                        logger.exception("Failed to process uploaded files")
+                        st.error("An error occurred while processing the uploaded files. Please check the file format and try again.")
                         
         # Display Database metrics
         st.markdown("### 📊 Index Metrics")
@@ -355,55 +375,60 @@ with col_right:
         
         # User input
         if query := st.chat_input("Ask a question about your documents..."):
-            # Display user message
-            with chat_container:
-                with st.chat_message("user"):
-                    st.write(query)
-            
-            st.session_state.chat_history.append({"role": "user", "content": query})
-            
-            # Query the RAG engine
-            if not api_key_input:
-                st.error("Please add your Gemini API Key in the sidebar.")
+            # Validate query length
+            if len(query) > MAX_QUERY_LENGTH:
+                st.error(f"Query is too long. Please limit your question to {MAX_QUERY_LENGTH} characters.")
             else:
-                with st.spinner("Retrieving document contexts and generating answer..."):
-                    try:
-                        # Retrieve documents
-                        results = st.session_state.vector_store.search(
-                            query, 
-                            api_key_input, 
-                            k=5
-                        )
-                        
-                        # Generate answer
-                        answer = rag_engine.generate_answer(
-                            query, 
-                            results, 
-                            api_key_input, 
-                            model_name=model_choice
-                        )
-                        
-                        # Display assistant message
-                        with chat_container:
-                            with st.chat_message("assistant"):
-                                st.write(answer)
-                                with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
-                                    for i, src in enumerate(results):
-                                        chunk = src["chunk"]
-                                        st.markdown(
-                                            f"**Source #{i+1}**: `{chunk['source']}` | Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
-                                        )
-                                        st.code(chunk["text"], language="text")
-                        
-                        # Save assistant message
-                        st.session_state.chat_history.append({
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": results
-                        })
-                        
-                        # Rerun to scroll container and refresh state
-                        st.rerun()
-                        
-                    except Exception as e:
-                        st.error(f"Error querying RAG system: {e}")
+              # Display user message
+              with chat_container:
+                  with st.chat_message("user"):
+                      st.write(query)
+            
+              st.session_state.chat_history.append({"role": "user", "content": query})
+            
+              # Query the RAG engine
+              if not api_key_input:
+                  st.error("Please add your Gemini API Key in the sidebar.")
+              else:
+                  with st.spinner("Retrieving document contexts and generating answer..."):
+                      try:
+                          # Retrieve documents
+                          results = st.session_state.vector_store.search(
+                              query, 
+                              api_key_input, 
+                              k=5
+                          )
+                          
+                          # Generate answer
+                          answer = rag_engine.generate_answer(
+                              query, 
+                              results, 
+                              api_key_input, 
+                              model_name=model_choice
+                          )
+                          
+                          # Display assistant message
+                          with chat_container:
+                              with st.chat_message("assistant"):
+                                  st.write(answer)
+                                  with st.expander("🔍 Verified Retreived Context & Reference Chunks"):
+                                      for i, src in enumerate(results):
+                                          chunk = src["chunk"]
+                                          st.markdown(
+                                              f"**Source #{i+1}**: `{chunk['source']}` | Page {chunk['page_num']} | Score: `{src['score']:.4f}`"
+                                          )
+                                          st.code(chunk["text"], language="text")
+                          
+                          # Save assistant message
+                          st.session_state.chat_history.append({
+                              "role": "assistant",
+                              "content": answer,
+                              "sources": results
+                          })
+                          
+                          # Rerun to scroll container and refresh state
+                          st.rerun()
+                          
+                      except Exception as e:
+                          logger.exception("Error querying RAG system")
+                          st.error("An error occurred while generating the answer. Please try again.")
